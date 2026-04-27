@@ -1,0 +1,11 @@
+flask
+flask-cors
+numpy
+opencv-python
+torch
+torchvision
+ultralytics
+Pillow
+requests
+transformers
+huggingface-hub
