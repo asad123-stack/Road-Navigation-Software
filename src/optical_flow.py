@@ -6,6 +6,41 @@ import cv2
 import numpy as np
 
 
+class KalmanMotionFilter:
+    """Smooths motion vectors using Kalman filtering."""
+    
+    def __init__(self, process_variance=0.01, measurement_variance=0.1):
+        self.dt = 1.0
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        
+        self.kf_x = cv2.KalmanFilter(2, 1)
+        self.kf_y = cv2.KalmanFilter(2, 1)
+        
+        for kf in [self.kf_x, self.kf_y]:
+            kf.measurementMatrix = np.array([[1, 0]], dtype=np.float32)
+            kf.transitionMatrix = np.array([[1, self.dt], [0, 1]], dtype=np.float32)
+            kf.processNoiseCov = np.eye(2, dtype=np.float32) * process_variance
+            kf.measurementNoiseCov = np.array([[measurement_variance]], dtype=np.float32)
+            kf.statePost = np.zeros((2, 1), dtype=np.float32)
+    
+    def filter(self, dx: float, dy: float) -> Tuple[float, float]:
+        """Apply Kalman filtering to motion vector."""
+        self.kf_x.predict()
+        self.kf_y.predict()
+        
+        measurement_x = np.array([[dx]], dtype=np.float32)
+        measurement_y = np.array([[dy]], dtype=np.float32)
+        
+        self.kf_x.correct(measurement_x)
+        self.kf_y.correct(measurement_y)
+        
+        smoothed_dx = float(self.kf_x.statePost[0, 0])
+        smoothed_dy = float(self.kf_y.statePost[0, 0])
+        
+        return smoothed_dx, smoothed_dy
+
+
 class VisualOdometry:
     def __init__(self) -> None:
         self.prev_gray = None
@@ -13,12 +48,17 @@ class VisualOdometry:
         self.x = 0.0
         self.y = 0.0
         self.trajectory: List[List[float]] = [[0.0, 0.0]]
+        self.feature_quality: List[int] = [100]
+        self.motion_magnitude: List[float] = [0.0]
+        
         self.feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
         self.lk_params = dict(
             winSize=(15, 15),
             maxLevel=2,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
         )
+        
+        self.kalman = KalmanMotionFilter(process_variance=0.01, measurement_variance=0.15)
 
     def update(self, frame: np.ndarray) -> Tuple[float, float, float, float]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -54,18 +94,33 @@ class VisualOdometry:
             return 0.0, 0.0, self.x, self.y
 
         delta = new_xy - old_xy
-        dx = float(np.median(delta[:, 0]))
-        dy = float(np.median(delta[:, 1]))
-        self.x += dx
-        self.y += dy
+        dx_raw = float(np.median(delta[:, 0]))
+        dy_raw = float(np.median(delta[:, 1]))
+        
+        dx_smooth, dy_smooth = self.kalman.filter(dx_raw, dy_raw)
+        
+        self.x += dx_smooth
+        self.y += dy_smooth
+        
+        magnitude = np.sqrt(dx_smooth**2 + dy_smooth**2)
         self.trajectory.append([round(self.x, 3), round(self.y, 3)])
+        self.motion_magnitude.append(magnitude)
+        
+        feature_quality = int((len(good_old) / 100.0) * 100)
+        self.feature_quality.append(feature_quality)
 
         self.prev_gray = gray
         self.prev_pts = new_xy.reshape(-1, 1, 2)
-        return round(dx, 3), round(dy, 3), round(self.x, 3), round(self.y, 3)
+        return round(dx_smooth, 3), round(dy_smooth, 3), round(self.x, 3), round(self.y, 3)
 
     def get_trajectory(self) -> List[List[float]]:
         return self.trajectory
+    
+    def get_feature_quality(self) -> List[int]:
+        return self.feature_quality
+    
+    def get_motion_magnitude(self) -> List[float]:
+        return self.motion_magnitude
 
     def reset(self) -> None:
         self.prev_gray = None
@@ -73,3 +128,7 @@ class VisualOdometry:
         self.x = 0.0
         self.y = 0.0
         self.trajectory = [[0.0, 0.0]]
+        self.feature_quality = [100]
+        self.motion_magnitude = [0.0]
+        self.kalman = KalmanMotionFilter(process_variance=0.01, measurement_variance=0.15)
+

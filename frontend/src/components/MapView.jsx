@@ -1,10 +1,12 @@
 import { useEffect } from "react";
 import { CircleMarker, MapContainer, Marker, Polyline, TileLayer, useMapEvents } from "react-leaflet";
+import { Map as MapIcon } from "lucide-react";
 import { getRoute } from "../api/helmetApi";
 
-function TapHandler({ setDestination, userPosition, setRoute }) {
+function TapHandler({ setDestination, userPosition, setRoute, readOnly }) {
   useMapEvents({
     async click(e) {
+      if (readOnly) return;
       const dest = { lat: e.latlng.lat, lng: e.latlng.lng };
       setDestination(dest);
       if (userPosition) {
@@ -31,24 +33,25 @@ export default function MapView({
   setRoute,
   obstaclePins,
   riskSegments,
+  readOnly = false,
 }) {
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    if (readOnly || !navigator.geolocation) return;
     const watcher = navigator.geolocation.watchPosition((pos) => {
       setUserPosition({ lat: pos.coords.latitude, lng: pos.coords.longitude });
     });
     return () => navigator.geolocation.clearWatch(watcher);
-  }, [setUserPosition]);
+  }, [setUserPosition, readOnly]);
 
   const center = userPosition ? [userPosition.lat, userPosition.lng] : [18.5204, 73.8567];
   const routeLatLng = (route.coordinates ?? []).map(([lng, lat]) => [lat, lng]);
 
   return (
-    <div className="visual-card">
-      <div className="visual-title">Live Map</div>
-      <MapContainer center={center} zoom={15} style={{ height: 360, borderRadius: 10 }}>
+    <div className="visual-card" style={readOnly ? { height: "100%", margin: 0, padding: 0 } : {}}>
+      {!readOnly && <div className="visual-title"><MapIcon size={12} /> LIVE TACTICAL MAP</div>}
+      <MapContainer center={center} zoom={15} style={{ height: readOnly ? "100%" : 360, borderRadius: 10 }}>
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-        <TapHandler setDestination={setDestination} userPosition={userPosition} setRoute={setRoute} />
+        <TapHandler setDestination={setDestination} userPosition={userPosition} setRoute={setRoute} readOnly={readOnly} />
         {userPosition && <CircleMarker center={[userPosition.lat, userPosition.lng]} radius={8} pathOptions={{ color: "#3b82f6" }} />}
         {destination && <Marker position={[destination.lat, destination.lng]} />}
         {riskSegments?.length > 0

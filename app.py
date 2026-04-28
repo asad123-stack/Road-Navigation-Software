@@ -26,6 +26,7 @@ scene_classifier = SceneClassifier()
 visual_odometry = VisualOdometry()
 
 obstacle_pins = []
+last_route = {"steps": [], "coordinates": []}
 OBSTACLE_PIN_TTL_SECONDS = 30
 DEPTH_EVERY_N_FRAMES = 2
 SCENE_EVERY_N_FRAMES = 3
@@ -48,7 +49,8 @@ def health():
             "service": "smarthelmet-nav",
             "models": {
                 "detector_loaded": detector.is_model_loaded(),
-                "depth_loaded": depth_estimator.is_model_loaded(),
+                "depth_midas_loaded": depth_estimator.is_model_loaded(),
+                "depth_adabins_loaded": depth_estimator.is_adabins_loaded(),
                 "risk_loaded": risk_scorer.is_model_loaded(),
                 "lstm_loaded": lstm_predictor.is_model_loaded(),
                 "scene_loaded": scene_classifier.is_model_loaded(),
@@ -59,9 +61,14 @@ def health():
 
 @app.post("/api/process_frame")
 def process_frame():
-    global frame_counter, last_zone_depths, last_scene_type
+    global frame_counter, last_zone_depths, last_scene_type, last_route
     payload = request.get_json(silent=True) or {}
     frame_data = payload.get("frame")
+    
+    # Track route updates from frontend
+    if "route" in payload:
+        last_route = payload.get("route", {})
+    
     if not isinstance(frame_data, str) or not frame_data:
         return jsonify({"error": "Missing required field: frame"}), 400
 
@@ -90,14 +97,26 @@ def process_frame():
     lstm_risk = lstm_predictor.predict()
     lstm_alert = lstm_predictor.get_alert()
 
-    cue = get_navigation_cue(detections, zone_depths, risk_score, scene_type)
+    lat = payload.get("lat")
+    lng = payload.get("lng")
+    
+    cue = get_navigation_cue(
+        detections, 
+        zone_depths, 
+        risk_score, 
+        scene_type,
+        user_lat=lat,
+        user_lng=lng,
+        route_steps=last_route.get("steps", []),
+        lstm_risk=lstm_risk
+    )
     trajectories = tracker.update(detections)
 
     dx, dy, cum_x, cum_y = visual_odometry.update(frame)
     odometry_trajectory = visual_odometry.get_trajectory()[-50:]
+    feature_quality = visual_odometry.get_feature_quality()[-50:]
+    motion_magnitude = visual_odometry.get_motion_magnitude()[-50:]
 
-    lat = payload.get("lat")
-    lng = payload.get("lng")
     get_active_obstacle_pins()
     if risk_score > 60 and isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
         label = detections[0]["label"] if detections else "obstacle"
@@ -106,7 +125,7 @@ def process_frame():
             del obstacle_pins[:-200]
 
     motion_vector = {"dx": dx, "dy": dy}
-    annotated = render_annotations(frame, detections, cue, risk_score, trajectories, odometry_trajectory, motion_vector)
+    annotated = render_annotations(frame, detections, cue, risk_score, trajectories, odometry_trajectory, motion_vector, feature_quality, motion_magnitude)
 
     response = {
         "cue": cue,
@@ -121,6 +140,10 @@ def process_frame():
         "motion_vector": motion_vector,
         "odometry_position": {"x": cum_x, "y": cum_y},
         "odometry_trajectory": odometry_trajectory,
+        "feature_quality": feature_quality,
+        "motion_magnitude": motion_magnitude,
+        "odom_x": cum_x,
+        "odom_y": cum_y,
         "obstacle_geo_pins": get_active_obstacle_pins()[-50:],
     }
     return jsonify(response)
@@ -131,6 +154,7 @@ if __name__ == "__main__":
         "[app.py] Model status | YOLO="
         f"{detector.is_model_loaded()} "
         f"Depth(MiDaS)={depth_estimator.is_model_loaded()} "
+        f"Depth(AdaBins)={depth_estimator.is_adabins_loaded()} "
         f"RiskMLP={risk_scorer.is_model_loaded()} "
         f"LSTM={lstm_predictor.is_model_loaded()} "
         f"Scene={scene_classifier.is_model_loaded()}"

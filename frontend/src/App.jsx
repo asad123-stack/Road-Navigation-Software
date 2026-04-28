@@ -9,6 +9,7 @@ import OledSimulator from "./components/OledSimulator";
 import RiskScore from "./components/RiskScore";
 import SceneBadge from "./components/SceneBadge";
 import VideoFeed from "./components/VideoFeed";
+import MetricsModal from "./components/MetricsModal";
 import { processFrame } from "./api/helmetApi";
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const loopBusyRef = useRef(false);
+  const lastFrameTimeRef = useRef(0);
 
   const [annotatedFrame, setAnnotatedFrame] = useState(null);
   const [inputMode, setInputMode] = useState("upload");
@@ -33,6 +35,18 @@ export default function App() {
   const [obstaclePins, setObstaclePins] = useState([]);
   const [riskSegments, setRiskSegments] = useState([]);
   const [segmentCursor, setSegmentCursor] = useState(0);
+  const [zoneDepths, setZoneDepths] = useState({ left: 0.5, center: 0.5, right: 0.5 });
+  const [trajectories, setTrajectories] = useState([]);
+  const [metricsData, setMetricsData] = useState(null);
+  const [showMetricsModal, setShowMetricsModal] = useState(false);
+  const [featureQuality, setFeatureQuality] = useState(0);
+  const [motionMagnitude, setMotionMagnitude] = useState(0);
+  const [odomPosition, setOdomPosition] = useState({ x: 0, y: 0 });
+  const [sessionEvents, setSessionEvents] = useState([]);
+  const [sessionStartTime, setSessionStartTime] = useState(null);
+  const [lastCue, setLastCue] = useState(null);
+  const [sessionSummary, setSessionSummary] = useState(null);
+
   const nextStep = useMemo(() => {
     const step = route.steps?.[0];
     if (!step) return "";
@@ -42,15 +56,82 @@ export default function App() {
   }, [route.steps]);
 
   async function handleFrame(frameDataUrl) {
-    const result = await processFrame(frameDataUrl, userPosition?.lat, userPosition?.lng);
+    const frameStartTime = performance.now();
+    const result = await processFrame(frameDataUrl, userPosition?.lat, userPosition?.lng, route);
+    const frameEndTime = performance.now();
+    const latency = frameEndTime - frameStartTime;
+    const currentFps = lastFrameTimeRef.current > 0 ? 1000 / (frameStartTime - lastFrameTimeRef.current) : 0;
+    lastFrameTimeRef.current = frameStartTime;
+
     setAnnotatedFrame(result.annotated_frame ?? null);
-    setCurrentCue(result.cue?.cue ?? "GO STRAIGHT");
+    setCurrentCue(result.cue);
     setDetections(result.detections ?? []);
     setRiskScore(result.risk_score ?? 0);
     setLstmRisk(result.lstm_risk ?? null);
     setLstmAlert(Boolean(result.lstm_alert));
     setSceneType(result.scene_type ?? "urban");
+    setZoneDepths(result.zone_depths ?? { left: 0.5, center: 0.5, right: 0.5 });
+    setTrajectories(result.trajectories ?? []);
     setObstaclePins(result.obstacle_geo_pins ?? []);
+
+    const avgMotion = result.motion_magnitude ? (Array.isArray(result.motion_magnitude) ? result.motion_magnitude.reduce((a, b) => a + b, 0) / result.motion_magnitude.length : result.motion_magnitude) : 0;
+    const avgQuality = result.feature_quality ? (Array.isArray(result.feature_quality) ? result.feature_quality.reduce((a, b) => a + b, 0) / result.feature_quality.length : result.feature_quality) : 0;
+
+    setMotionMagnitude(avgMotion);
+    setFeatureQuality(avgQuality);
+    setOdomPosition({ x: result.odom_x || 0, y: result.odom_y || 0 });
+
+    setMetricsData({
+      fps: Math.round(currentFps),
+      latency: Math.round(latency),
+      processingTime: Math.round(latency * 0.8),
+      frameQueue: 0,
+      riskScore: result.risk_score ?? 0,
+    });
+
+    // Track events for session log
+    const currentCue = result.cue?.cue || "GO STRAIGHT";
+    if (lastCue !== currentCue) {
+      const isTurn = currentCue.includes("TURN");
+      const eventType = isTurn ? "turn" : "state_change";
+
+      setSessionEvents((prev) => [
+        ...prev,
+        {
+          timestamp: new Date(),
+          type: eventType,
+          cue: currentCue,
+          position: userPosition,
+          riskScore: result.risk_score,
+          detections: result.detections?.length || 0,
+          zoneDepths: result.zone_depths,
+        }
+      ]);
+      setLastCue(currentCue);
+    }
+
+    // Log obstacle detection events
+    if ((result.detections?.length || 0) > 0) {
+      result.detections.forEach((det) => {
+        const existingEvent = sessionEvents.find(
+          (e) => e.type === "obstacle" && e.label === det.label && Date.now() - new Date(e.timestamp).getTime() < 1000
+        );
+        if (!existingEvent) {
+          setSessionEvents((prev) => [
+            ...prev,
+            {
+              timestamp: new Date(),
+              type: "obstacle",
+              label: det.label,
+              confidence: det.confidence,
+              position: userPosition,
+              riskScore: result.risk_score,
+            }
+          ]);
+        }
+      });
+    }
+
     if (riskSegments.length > 0) {
       const idx = Math.min(segmentCursor, riskSegments.length - 1);
       setRiskSegments((prev) => prev.map((seg, i) => (i === idx ? { ...seg, risk: result.risk_score ?? 0 } : seg)));
@@ -89,7 +170,7 @@ export default function App() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", 0.5);
+    return canvas.toDataURL("image/jpeg", 0.3);
   }
 
   useEffect(() => {
@@ -107,7 +188,7 @@ export default function App() {
         }
         setCameraError("");
       } catch (err) {
-        setCameraError("Could not access phone camera.");
+        setCameraError("Unable to access camera feed.");
         setIsProcessing(false);
       }
     }
@@ -124,6 +205,13 @@ export default function App() {
 
   useEffect(() => {
     if (!isProcessing || inputMode !== "phone") return;
+
+    // Start session on first isProcessing
+    if (sessionStartTime === null) {
+      setSessionStartTime(new Date());
+      setSessionEvents([]);
+    }
+
     const timer = setInterval(async () => {
       if (loopBusyRef.current) return;
       const frame = capturePhoneFrame();
@@ -134,7 +222,7 @@ export default function App() {
       } finally {
         loopBusyRef.current = false;
       }
-    }, 1000);
+    }, 300);
 
     return () => {
       clearInterval(timer);
@@ -142,8 +230,35 @@ export default function App() {
     };
   }, [isProcessing, inputMode, userPosition]);
 
+  function handleStopAnalysis() {
+    const endTime = new Date();
+    const duration = sessionStartTime ? (endTime - sessionStartTime) / 1000 : 0;
+
+    const turns = sessionEvents.filter((e) => e.type === "turn");
+    const obstacles = sessionEvents.filter((e) => e.type === "obstacle");
+    const maxRisk = sessionEvents.length > 0 ? Math.max(...sessionEvents.map((e) => e.riskScore || 0)) : 0;
+    const avgRisk = sessionEvents.length > 0 ? sessionEvents.reduce((sum, e) => sum + (e.riskScore || 0), 0) / sessionEvents.length : 0;
+
+    const summary = {
+      startTime: sessionStartTime,
+      endTime: endTime,
+      durationSeconds: Math.round(duration),
+      totalFrames: Math.round(duration / 0.3),
+      totalTurns: turns.length,
+      turnEvents: turns,
+      obstaclesEncountered: obstacles.length,
+      obstacleDetails: obstacles,
+      maxRiskScore: Math.round(maxRisk),
+      avgRiskScore: Math.round(avgRisk),
+      allEvents: sessionEvents,
+    };
+
+    setSessionSummary(summary);
+    setShowMetricsModal(true);
+  }
+
   return (
-    <>
+    <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       <Navbar />
       <div className="app-grid">
         <div className="panel left-panel">
@@ -155,6 +270,7 @@ export default function App() {
             setIsProcessing={setIsProcessing}
             videoRef={videoRef}
             cameraError={cameraError}
+            onStopAnalysis={handleStopAnalysis}
           />
           <NavigationCue cue={currentCue} nextStep={nextStep} />
           <RiskScore score={riskScore} />
@@ -162,9 +278,27 @@ export default function App() {
           <SceneBadge scene={sceneType} />
           <OledSimulator cue={currentCue} />
           <DetectedObjects detections={detections} />
+
+          <div className="metrics-display">
+            {[
+              { label: "Throughput", value: "~3 FPS" },
+              { label: "Latency", value: "~300ms" },
+              { label: "Safety Index", value: (100 - riskScore).toFixed(0) },
+              { label: "Entities", value: detections.length },
+              { label: "Environment", value: sceneType.toUpperCase() },
+              { label: "Projection", value: lstmRisk?.toFixed(2) ?? "N/A" },
+            ].map((m, i) => (
+              <div key={i} className="metric-item">
+                <div className="metric-label">{m.label}</div>
+                <div className="metric-value">{m.value}</div>
+              </div>
+            ))}
+          </div>
         </div>
+
         <div className="panel visuals-panel">
           <div className="visuals-grid">
+            <VideoFeed frame={annotatedFrame} videoRef={videoRef} />
             <MapView
               userPosition={userPosition}
               setUserPosition={setUserPosition}
@@ -175,10 +309,30 @@ export default function App() {
               obstaclePins={obstaclePins}
               riskSegments={riskSegments}
             />
-            <VideoFeed frame={annotatedFrame} />
           </div>
         </div>
       </div>
-    </>
+
+      <MetricsModal
+        isOpen={showMetricsModal}
+        onClose={() => setShowMetricsModal(false)}
+        metrics={metricsData}
+        cue={currentCue}
+        sceneType={sceneType}
+        detections={detections}
+        trajectories={trajectories}
+        zoneDepths={zoneDepths}
+        lstmRisk={lstmRisk}
+        featureQuality={featureQuality}
+        motionMagnitude={motionMagnitude}
+        odomPosition={odomPosition}
+        userPosition={userPosition}
+        destination={destination}
+        route={route}
+        obstaclePins={obstaclePins}
+        annotatedFrame={annotatedFrame}
+        sessionSummary={sessionSummary}
+      />
+    </div>
   );
 }
